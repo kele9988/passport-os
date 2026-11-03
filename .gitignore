@@ -1,0 +1,30 @@
+build/
+build-public/
+sdkconfig
+sdkconfig.old
+managed_components/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.log
+*.bin
+*.elf
+*.map
+dist/
+.cache/
+build-diag/
+build-*/
+output/
+release/
+sdkconfig.diag
+all_chars.txt
+ui_chars.txt
+.impeccable/
+
+# Generated firmware and local validation artifacts
+*.uf2
+*.hex
+
+# Local device firmware backups, never part of the tree
+_fw_backup/
