@@ -1036,13 +1036,16 @@ void home_task(void *arg) {
             clock_on = false;
         }
 
-        // BLE 兜底(见 start() 里的说明):只在 WiFi TCP 通道 25 秒内没建起来时
-        // 才引导蓝牙栈,避免开机就吃掉 ~60KB 内部堆。一旦 TCP 连上就一直不启,
-        // 把堆留给天气 TLS 和 WB 应用;PC 关机/不在同一网段时仍能蓝牙兜底。
+        // BLE 兜底(见 start() 里的说明):只在【开机以来从未连上过 PC】且已过
+        // 25 秒时才引导蓝牙栈,避免开机就吃掉 ~60KB 内部堆。一旦 TCP 连上过就
+        // 永久不再启(哪怕随后守护退出导致 TCP 断开)——那种场景下 PC 根本不在,
+        // 拉起 60KB 蓝牙毫无用处,反而会在用户点开 WB 时把堆吃光导致 OOM。
         static bool s_ble_kicked = false;
-        if (!s_ble_kicked && (now_ms - start_ms) > 25000 && !wb_wifi_link_connected()) {
+        static bool s_tcp_ever = false;
+        if (wb_wifi_link_connected()) s_tcp_ever = true;
+        if (!s_ble_kicked && !s_tcp_ever && (now_ms - start_ms) > 25000) {
             const esp_err_t vis = wb_ble_visible_start();
-            ESP_LOGW(kTag, "TCP 未连上(25s),BLE 兜底启动: %s", esp_err_to_name(vis));
+            ESP_LOGW(kTag, "开机 25s 内未连上 PC,BLE 兜底启动: %s", esp_err_to_name(vis));
             s_ble_kicked = true;
         }
 
