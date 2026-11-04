@@ -884,7 +884,7 @@ void render_rec(bool conn) {
 }
 
 const char *footer_left() {
-    if (s_mode == Mode::kApproval && s_appr.valid) return "↑ 允许";
+    if (s_mode == Mode::kApproval && s_appr.valid) return "OK 允许";
     if (s_mode == Mode::kAsk && s_ask.valid) return "↑ 选择";
     if (s_mode == Mode::kRecording) return "OK 发往";
     return "↓ 翻页";
@@ -922,12 +922,12 @@ void render_alert() {
         set_text(s_a_title, s_appr.tool);
         set_color(s_a_title, COL_TEXT);
         set_text(s_a_body, s_appr.hint[0] ? s_appr.hint : "(无说明)");
-        set_text(s_a_opt[0], "↑ 通过 运行这条命令");
+        set_text(s_a_opt[0], "OK 通过 运行这条命令");
         set_text(s_a_opt[1], "↓ 拒绝 阻止执行");
         set_text(s_a_opt[2], "");
         set_color(s_a_opt[0], COL_GREEN);
         set_color(s_a_opt[1], COL_RED);
-        set_text(s_a_hint, "长按 ↓ 强制拒绝");
+        set_text(s_a_hint, "长按 OK 返回");
         set_color(s_a_hint, COL_MUTED);
         return;
     }
@@ -1605,9 +1605,16 @@ void start() {
     if (wb_wifi_link_connected()) {
         ESP_LOGW(TAG, "bringup: TCP 已连接,跳过 BLE 引导(省 ~66KB 连续堆)");
         ble_skipped = true;
-    } else if (largest0 < 80 * 1024) {
-        // BLE 引导实测需要 largest>=69.6KB 才稳;不足时宁要 UI 不要蓝牙。
-        ESP_LOGW(TAG, "bringup: largest=%u 不足以引导 BLE(需>=80KB),跳过", (unsigned)largest0);
+    } else if (largest0 < 128 * 1024) {
+        // 2026-11-04 崩溃复盘:clean launch 冷启直接进本应用时 WiFi 还没连上,
+        // largest≈96KB 会通过旧的 80KB 门槛 → 引导 BLE 吃掉 66KB → 紧接着
+        // wb_voice_init 20KB + 建 UI(上百个 LVGL 对象)全部 OOM → 硬崩重启,
+        // 外观表现就是「点开→整理内存→连续两次重启→回到首页」。
+        // BLE 引导 + 语音工作区 + UI 实测要同时容纳,largest 需 >=128KB;冷启
+        // 阶段永远达不到(开机空堆也只有 96KB),故这里一律跳过 BLE。
+        // PC 伴生走 WiFi TCP(wb_ble_send_line 本就 TCP 优先),不依赖蓝牙。
+        ESP_LOGW(TAG, "bringup: largest=%u 放不下 BLE+语音+UI(需>=128KB),跳过 BLE",
+                 (unsigned)largest0);
         ble_skipped = true;
     } else {
         ESP_LOGW(TAG, "bringup: wb_ble_start (largest=%u)", (unsigned)largest0);

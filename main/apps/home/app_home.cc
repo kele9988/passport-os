@@ -1036,6 +1036,16 @@ void home_task(void *arg) {
             clock_on = false;
         }
 
+        // BLE 兜底(见 start() 里的说明):只在 WiFi TCP 通道 25 秒内没建起来时
+        // 才引导蓝牙栈,避免开机就吃掉 ~60KB 内部堆。一旦 TCP 连上就一直不启,
+        // 把堆留给天气 TLS 和 WB 应用;PC 关机/不在同一网段时仍能蓝牙兜底。
+        static bool s_ble_kicked = false;
+        if (!s_ble_kicked && (now_ms - start_ms) > 25000 && !wb_wifi_link_connected()) {
+            const esp_err_t vis = wb_ble_visible_start();
+            ESP_LOGW(kTag, "TCP 未连上(25s),BLE 兜底启动: %s", esp_err_to_name(vis));
+            s_ble_kicked = true;
+        }
+
         // 资料(含头像)变化:先在锁外做文件 IO,再持锁更新 UI。
         const uint32_t profile_ver = home_profile_version();
         if (profile_ver != last_profile_ver) {
@@ -1202,12 +1212,13 @@ void home_start() {
     // 等 WiFi 就绪,连不上 WiFi 就一直等,不占额外资源。
     wb_wifi_link_start();
 
-    // BLE「常可见」(兜底通道):设备不在同一 WiFi 网段时 PC 仍可经蓝牙连上。
-    // 失败不再永久放弃——wb_ble 层后台每 3 秒自动重试,内存一空出来就补上引导。
-    const esp_err_t vis = wb_ble_visible_start();
-    if (vis != ESP_OK) {
-        ESP_LOGW(kTag, "BLE 常可见启动失败(将自动重试): %s", esp_err_to_name(vis));
-    }
+    // BLE「常可见」不再开机即引导(2026-11-04 实测):NimBLE 主机栈一次吃掉
+    // ~60KB 内部堆,首页起来后只剩 9KB——天气 HTTPS 在证书校验阶段 alloc 失败
+    // (esp-x509-crt-bundle PK verify failed → alloc(2389) failed),WB 应用也因
+    // 堆不够被迫走 clean launch「重启换干净堆」,而冷启时 WiFi 还没连上又误判
+    // 可以引导 BLE,结果 UI 构建 OOM 硬崩,表现为「点开→整理内存→重启→回首页」。
+    // 改为延迟兜底:TCP 通道 25 秒内没连上(PC 不在/不在同一网段)时,由
+    // home_task 拉起蓝牙。不开蓝牙时首页可留 ~75KB,WB 可直接打开、天气也能取到。
 }
 
 bool home_prepare_stop() {
