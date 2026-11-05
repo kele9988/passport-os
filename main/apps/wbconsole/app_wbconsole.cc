@@ -138,6 +138,10 @@ PcMon s_pc = {};   // gpu/gt/ct 为 -1 才是"未检出";首帧到达前 fresh �
 static bool s_pc_seen = false;   // 首帧置位,配合把未解析字段置 -1
 
 volatile int s_target = 0;               // 0 reply 1 job 2 manual
+static int64_t s_target_us = 0;          // 上次选定/使用目标的时刻，用于空闲回落
+// 选定「新任务/听写」后这么久没说一句话，就回到「对话」——防"忘了切回来随口
+// 一句就开任务白烧积分"。只在录音页可选，所以这个时长按"思考一下再说"给足。
+static const int64_t TARGET_IDLE_MS = 120000;
 static const char *k_targets[3] = {"reply", "job", "manual"};
 // 显示名面向用户:reply=说进当前对话 job=新建任务 manual=只转文字不发
 static const char *k_target_names[3] = {"对话", "新任务", "听写"};
@@ -557,6 +561,10 @@ void handle_link(bool connected) {
         s_mode = Mode::kStatus;
         s_appr.valid = false;
         s_ask.valid = false;
+        // 断链即把语音目标收回「对话」：重连后 PC 端也会重置成 reply（见 wb_app.py
+        // 的连接回调），两边保持一致，避免"设备显示对话、PC 按新任务投递"。
+        s_target = 0;
+        s_target_us = 0;
         // 刻意保留积分与会话快照:短暂断连(PC 重启/看护重连的空档)不该把
         // 用户刚看到的内容抹成空页。是否在线由顶栏链路胶囊表达。
     }
@@ -587,13 +595,11 @@ void show_page(int p) {
     // 顶栏跟着换页(徽章已删,只换页名)
     set_text(s_title, k_meta[p].title);
 
-    // 语音投递目标只在录音页有效:离开录音页立刻回收成「回复」并上报。
-    // 否则切到「任务」档后忘了切回来,在后面随口说一句话就会开一个新任务、
-    // 白烧积分 —— 这个档位的破坏性只有离开视野才显现,所以不能靠人记住。
-    if (p != kPgRec && s_target != 0) {
-        s_target = 0;
-        (void)sendf("{\"type\":\"msg_target\",\"target\":\"reply\"}");
-    }
+    // 语音投递目标**跨页保留**：只在录音页能改（OK 循环），选定后一直生效，
+    // 空闲 2 分钟或退出应用才回到「对话」。
+    // 旧行为是"离开录音页立刻回收成对话"，但页面上没有任何提示：用户选完「新任务」
+    // 翻页再说话，话就悄悄进了当前对话（2026-11-05 真机反馈：反复"发到本窗口"）。
+    // 防误触仍由两道闸承担：仅录音页可改 + 空闲回落（见 tick 里的 TARGET_IDLE_MS）。
     s_shown_page = p;
 }
 
@@ -861,7 +867,7 @@ void render_rec(bool conn) {
     set_text(s_rec_vu, buf);
     set_color(s_rec_vu, pct > 92 ? COL_RED : COL_CYAN);
 
-    std::snprintf(buf, sizeof(buf), "语音投递：%s", k_target_names[s_target]);
+    std::snprintf(buf, sizeof(buf), "语音投递：%s · OK 切换", k_target_names[s_target]);
     set_text(s_rec_chan, buf);
     // 目标档位高亮:对话=绿(安全默认) 新任务=琥珀(白烧积分档) 听写=青;
     // 原先 COL_DIM 暗色与背景几乎同色,用户看不到当前档位。
@@ -1005,6 +1011,15 @@ void tick(lv_timer_t *timer) {
     }
     if (s_mode != Mode::kRecording && s_msg_until_us && now >= s_msg_until_us) {
         s_msg_until_us = 0;
+    }
+    // 语音投递目标空闲回落：录音期间一直续期；说完 2 分钟没再开口就回「对话」，
+    // 并上报给 PC —— 两边必须同步，否则设备显示「对话」而 PC 还按「新任务」投递。
+    if (s_mode == Mode::kRecording) {
+        s_target_us = now;
+    } else if (s_target != 0 && s_target_us && now - s_target_us >= TARGET_IDLE_MS * 1000LL) {
+        s_target = 0;
+        s_target_us = 0;
+        (void)sendf("{\"type\":\"msg_target\",\"target\":\"reply\"}");
     }
     // 提醒结束且是自动切进来的,退回原页
     if (s_page == kPgAlert && s_alert_auto && !s_appr.valid && !s_ask.valid) {
@@ -1196,6 +1211,7 @@ void on_key(uint8_t btn, app_btn_event_t event, uint16_t mv) {
         if (s_page == kPgRec) {
             const int next = (s_target + 1) % 3;
             s_target = next;
+            s_target_us = esp_timer_get_time();   // 重新计时：刚选过就别马上回落
             (void)sendf("{\"type\":\"msg_target\",\"target\":\"%s\"}", k_targets[next]);
         }
         return;
