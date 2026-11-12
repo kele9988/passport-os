@@ -33,7 +33,9 @@ idf_component_register(
         "apps/vokie/app_vokie.cc"
         "apps/vokie/vokie_ble.c"
         "apps/vokie/ui_status.c"
-        "apps/wbconsole/app_wbconsole.cc"
+        # 2026-11-07:WB 伴生应用下架,app_wbconsole.cc 不再参与构建;
+        # wb_ble/wb_wifi_link/wb_voice 保留编译(对讲机/Vokie/小智共享 BLE 宿主),
+        # 启动点已全部移除,运行期零开销。
         "apps/wbconsole/wb_ble.c"
         "apps/wbconsole/wb_wifi_link.c"
         "apps/wbconsole/wb_voice.c"
@@ -117,3 +119,15 @@ if(PASSPORT_DEFAULT_ROOM)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE
         TALKIE_DEFAULT_ROOM="${PASSPORT_DEFAULT_ROOM}")
 endif()
+# 对讲 WS 兜底通道：-DPASSPORT_TALKIE_WS_HOST=<域名> 注入（编译为 TALKIE_WS_HOST）。
+# TCP 双栈全失败时改走 wss://<域名>（CF 隧道回源家里 WS 桥→relay）。不传则无兜底。
+if(PASSPORT_TALKIE_WS_HOST)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        TALKIE_WS_HOST="${PASSPORT_TALKIE_WS_HOST}")
+endif()
+
+# WorkBuddy 伴生应用已于 2026-11-07 整体下架(用户要求):
+# - app_wbconsole.cc 不再参与构建,launcher 轮播无该卡位;
+# - wb_wifi_link.c 仍编译但启动点已移除(运行期零开销),原「设备主动外连」
+#   的 HOST/PORT/TOKEN 注入逻辑随之删除,需要恢复时从 git 历史找回;
+# - wb_ble/wb_voice 保留编译,供对讲机/Vokie/小智共享 NimBLE 宿主。

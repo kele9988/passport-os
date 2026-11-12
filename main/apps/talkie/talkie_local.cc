@@ -58,7 +58,7 @@ TaskHandle_t g_playback_task = nullptr;
 TaskHandle_t g_ctrl_task = nullptr;
 
 std::atomic<uint8_t> g_logical_channel{1};
-std::atomic<uint8_t> g_volume_percent{70};
+std::atomic<uint8_t> g_volume_percent{100};
 std::atomic<uint32_t> g_tx_session{0};
 std::atomic<uint16_t> g_tx_sequence{0};
 std::atomic<bool> g_ptt{false};
@@ -67,6 +67,8 @@ std::atomic<int> g_channel_step{0};   // 请求切频道的步进(+1/-1)，空�
 std::atomic<bool> g_running{false};
 std::atomic<int> g_last_wave{0};           // 最近一帧载荷字节数（波形柱）
 std::atomic<bool> g_weak_signal{false};
+std::atomic<uint32_t> g_rx_audio{0};       // 诊断：收到的音频帧总数（decode 成功即计）
+std::atomic<uint32_t> g_tx_audio_frames{0}; // 诊断：本轮采集实际编码发出的音频帧数
 
 // 缓冲放静态区：各约 2KB，避免吃任务栈。
 struct AudioBuffers {
@@ -126,7 +128,16 @@ bool encode_and_send(const int16_t *samples, wa::AdpcmState &encoder_state) {
     const uint16_t sequence = g_tx_sequence.fetch_add(1);
     const bool ok = send_packet(make_header(wp::MessageType::Audio, g_tx_session.load(), sequence),
                                 payload.data(), payload.size());
-    if (ok) g_last_wave.store(static_cast<int>(wp::kAudioPayloadSize));
+    if (ok) {
+        g_last_wave.store(static_cast<int>(wp::kAudioPayloadSize));
+        g_tx_audio_frames.fetch_add(1, std::memory_order_relaxed);
+        // 二次冗余：ESP-NOW 广播无重传，丢 1 包=20ms 静音（听感就是「字间卡顿」）。
+        // 同序号重发一遍，接收端 jitter 按序号去重，单包丢失几乎归零。
+        // 第二发只等 4ms，忙则放弃（首发大概率已到达）。
+        vTaskDelay(pdMS_TO_TICKS(4));
+        send_packet(make_header(wp::MessageType::Audio, g_tx_session.load(), sequence),
+                    payload.data(), payload.size());
+    }
     return ok;
 }
 
@@ -140,6 +151,8 @@ void capture_task(void *) {
     wa::AdpcmState encoder_state{};
     size_t record_index = 0;
     size_t queued = 0;
+    uint32_t read_fail_streak = 0;
+    uint32_t last_read_fail_log_ms = 0;
     for (;;) {
         xEventGroupWaitBits(g_audio_events, kCaptureBit, pdFALSE, pdFALSE, portMAX_DELAY);
         xSemaphoreTake(g_audio_owner, portMAX_DELAY);
@@ -154,11 +167,27 @@ void capture_task(void *) {
         encoder_state = {};
         record_index = 0;
         queued = 0;
+        read_fail_streak = 0;
+        ESP_LOGI(kTag, "采集开始");
         while ((xEventGroupGetBits(g_audio_events) & kCaptureBit) != 0) {
-            if (!bsp_audio_read(g_audio_buf.pcm[record_index].data(),
-                                wp::kAudioSamples * sizeof(int16_t))) {
+            // 注意：bsp_audio_read 返回 esp_err_t，ESP_OK==0。
+            // 千万不能写 !bsp_audio_read(...) —— 那会把「成功」当「失败」，
+            // 采集一帧都发不出去（这正是近场对讲一直没声音的根因）。
+            if (bsp_audio_read(g_audio_buf.pcm[record_index].data(),
+                               wp::kAudioSamples * sizeof(int16_t)) != ESP_OK) {
+                ++read_fail_streak;
+                // 读取失败绝不能静默空转：否则按下讲话后一帧都发不出，
+                // 对端只显示「接收」然后 800ms 超时，完全没有线索。
+                if (now_ms() - last_read_fail_log_ms >= 2000) {
+                    ESP_LOGE(kTag, "录音读取失败 连续=%lu", (unsigned long)read_fail_streak);
+                    last_read_fail_log_ms = now_ms();
+                }
                 vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
+            }
+            if (read_fail_streak != 0) {
+                ESP_LOGI(kTag, "录音恢复(此前连续失败 %lu 次)", (unsigned long)read_fail_streak);
+                read_fail_streak = 0;
             }
             // 三缓冲：读满 3 帧再发最早的，平滑 I2S DMA 的节奏抖动
             ++queued;
@@ -168,6 +197,7 @@ void capture_task(void *) {
             }
             record_index = (record_index + 1) % g_audio_buf.pcm.size();
         }
+        ESP_LOGI(kTag, "采集停止(本次已发 %lu 帧)", (unsigned long)g_tx_audio_frames.load());
         bsp_audio_set_volume(0);
         xSemaphoreGive(g_audio_owner);
     }
@@ -177,17 +207,24 @@ void capture_task(void *) {
 
 void playback_task(void *) {
     size_t buffer_index = 0;
+    uint32_t write_fail_streak = 0;
+    uint32_t last_write_fail_log_ms = 0;
+    int32_t lpf_y = 0;                    // 高频柔和滤波器状态（见下方低通）
     for (;;) {
         xEventGroupWaitBits(g_audio_events, kPlaybackBit, pdFALSE, pdTRUE, portMAX_DELAY);
         xSemaphoreTake(g_audio_owner, portMAX_DELAY);
         g_audio_buf.jitter.reset();
+        lpf_y = 0;                        // 每次播放会话复位，避免残留值产生咔哒声
+        ESP_LOGI(kTag, "播放开始");
         if (bsp_audio_set_format(16000, 16, 1) != ESP_OK) {
             ESP_LOGE(kTag, "播放格式设置失败");
             xEventGroupClearBits(g_audio_events, kPlaybackBit);
             xSemaphoreGive(g_audio_owner);
             continue;
         }
-        bsp_audio_set_volume(g_volume_percent.load());
+        // 直通音量：主音量默认 80% 会把 100% 请求压到 -10dB 档，对讲听感太小
+        bsp_audio_set_volume_direct(g_volume_percent.load());
+        write_fail_streak = 0;
         for (;;) {
             if ((xEventGroupGetBits(g_audio_events) & kPlaybackBit) == 0) break;
             const TickType_t wait = g_audio_buf.jitter.started() ? 0 : pdMS_TO_TICKS(30);
@@ -211,15 +248,35 @@ void playback_task(void *) {
             if (wa::decode_ima_adpcm(g_audio_buf.frame.data.data(), g_audio_buf.frame.data.size(),
                                      g_audio_buf.pcm[buffer_index].data(),
                                      wp::kAudioSamples, state)) {
+                // 高频柔和：一阶低通，转折 ~4kHz（α≈0.80 @16kHz）。
+                // 小喇叭在 5-8kHz 有共振峰，听感「尖锐」；压掉高频不影响语音可懂度。
+                // 只作用于对讲播放，不影响系统其他音频。lpf_y 在播放开始时复位。
+                for (size_t i = 0; i < wp::kAudioSamples; ++i) {
+                    lpf_y += (static_cast<int32_t>(g_audio_buf.pcm[buffer_index][i]) - lpf_y) * 205 / 256;
+                    g_audio_buf.pcm[buffer_index][i] = static_cast<int16_t>(lpf_y);
+                }
                 g_last_wave.store(static_cast<int>(wp::kAudioPayloadSize));
-                while (!bsp_audio_write(g_audio_buf.pcm[buffer_index].data(),
-                                        wp::kAudioSamples * sizeof(int16_t)) &&
+                // 同上：esp_err_t 语义，ESP_OK==0；!写法会把成功当失败死循环重写
+                while (bsp_audio_write(g_audio_buf.pcm[buffer_index].data(),
+                                       wp::kAudioSamples * sizeof(int16_t)) != ESP_OK &&
                        (xEventGroupGetBits(g_audio_events) & kPlaybackBit) != 0) {
+                    // 写入持续失败（设备未开/忙）绝不能静默空转
+                    ++write_fail_streak;
+                    if (now_ms() - last_write_fail_log_ms >= 2000) {
+                        ESP_LOGE(kTag, "播放写入失败 连续=%lu", (unsigned long)write_fail_streak);
+                        last_write_fail_log_ms = now_ms();
+                    }
                     vTaskDelay(pdMS_TO_TICKS(2));
+                }
+                if (write_fail_streak != 0) {
+                    ESP_LOGI(kTag, "播放写入恢复(此前连续失败 %lu 次)",
+                             (unsigned long)write_fail_streak);
+                    write_fail_streak = 0;
                 }
                 buffer_index = (buffer_index + 1) % g_audio_buf.pcm.size();
             }
         }
+        ESP_LOGI(kTag, "播放停止");
         bsp_audio_set_volume(0);
         xQueueReset(g_playback_queue);
         xSemaphoreGive(g_audio_owner);
@@ -283,6 +340,9 @@ void publish_snapshot(const TalkController &controller) {
     g_snap.busy = (st == TalkState::Busy);
     g_snap.requesting = (st == TalkState::Requesting);
     g_snap.weak = g_weak_signal.load();
+    g_snap.tx_ok = static_cast<int>(g_transport.tx_ok());
+    g_snap.tx_fail = static_cast<int>(g_transport.tx_fail());
+    g_snap.rx_audio = static_cast<int>(g_rx_audio.load(std::memory_order_relaxed));
     std::memset(g_snap.speaker, 0, sizeof(g_snap.speaker));
     if (st == TalkState::Receiving || st == TalkState::Busy) {
         if (const Peer *peer = g_presence.find(controller.snapshot().speaker_id);
@@ -314,6 +374,10 @@ void ctrl_task(void *) {
         uint32_t observed_dropped_rx = 0;
         uint32_t weak_signal_until_ms = 0;
         bool was_ptt = false;
+        uint32_t last_gate_log_ms = 0;        // 音频门控拒绝日志节流
+        uint32_t last_rx_summary_ms = 0;      // RX 诊断汇总节流(1s)
+        uint32_t last_summary_rx = 0;
+        uint32_t last_summary_dropped = 0;
         ESP_LOGI(kTag, "近场对讲就绪 %s CH%u 射频信道 %u", local_name.data(),
                  g_logical_channel.load(), g_transport.radio_channel());
 
@@ -358,6 +422,9 @@ void ctrl_task(void *) {
                     g_presence.observe(packet.header.sender_id, heartbeat, now, received.rssi);
                 }
             } else {
+                if (packet.header.type == wp::MessageType::Audio) {
+                    g_rx_audio.fetch_add(1, std::memory_order_relaxed);
+                }
                 wp::DeviceState activity = wp::DeviceState::Idle;
                 if (packet.header.type == wp::MessageType::TalkClaim) {
                     activity = wp::DeviceState::Requesting;
@@ -380,28 +447,50 @@ void ctrl_task(void *) {
                 case wp::MessageType::TalkStart:
                     actions = controller.receive_start(packet.header, now);
                     break;
-                case wp::MessageType::Audio:
+                case wp::MessageType::Audio: {
                     actions = controller.receive_audio(packet.header, now);
-                    if (packet.header.payload_length == wp::kAudioPayloadSize &&
-                        (controller.snapshot().state == TalkState::Receiving ||
-                         controller.snapshot().state == TalkState::Busy) &&
-                        packet.header.session_id == controller.snapshot().session_id &&
-                        packet.header.sender_id == controller.snapshot().speaker_id) {
-                        wa::EncodedAudioFrame audio_frame{};
-                        audio_frame.session_id = packet.header.session_id;
-                        audio_frame.sequence = packet.header.sequence;
-                        audio_frame.initial_state.predictor = static_cast<int16_t>(
-                            (static_cast<uint16_t>(packet.payload[0]) << 8) | packet.payload[1]);
-                        audio_frame.initial_state.step_index = packet.payload[2];
-                        if (audio_frame.initial_state.step_index <= 88 && packet.payload[3] == 0) {
-                            std::memcpy(audio_frame.data.data(), packet.payload + 4,
-                                        audio_frame.data.size());
-                            if (xQueueSend(g_playback_queue, &audio_frame, 0) != pdTRUE) {
-                                weak_signal_until_ms = now + 1500;
+                    // 音频帧入队前的多重门控——任何一门不过都会静默丢帧，
+                    // 这里把拒绝原因节流打出来（1s 一条），否则无从定位。
+                    const auto &snap = controller.snapshot();
+                    const bool state_ok = snap.state == TalkState::Receiving ||
+                                          snap.state == TalkState::Busy;
+                    const bool gated = !state_ok ||
+                                       packet.header.payload_length != wp::kAudioPayloadSize ||
+                                       packet.header.session_id != snap.session_id ||
+                                       packet.header.sender_id != snap.speaker_id;
+                    if (gated) {
+                        if (now - last_gate_log_ms >= 1000) {
+                            last_gate_log_ms = now;
+                            ESP_LOGW(kTag, "音频帧被丢: len=%u 状态=%d 会话%u/%u 说话人%d",
+                                     packet.header.payload_length, static_cast<int>(snap.state),
+                                     packet.header.session_id, snap.session_id,
+                                     static_cast<int>(packet.header.sender_id == snap.speaker_id));
+                        }
+                        break;
+                    }
+                    wa::EncodedAudioFrame audio_frame{};
+                    audio_frame.session_id = packet.header.session_id;
+                    audio_frame.sequence = packet.header.sequence;
+                    audio_frame.initial_state.predictor = static_cast<int16_t>(
+                        (static_cast<uint16_t>(packet.payload[0]) << 8) | packet.payload[1]);
+                    audio_frame.initial_state.step_index = packet.payload[2];
+                    if (audio_frame.initial_state.step_index <= 88 && packet.payload[3] == 0) {
+                        std::memcpy(audio_frame.data.data(), packet.payload + 4,
+                                    audio_frame.data.size());
+                        if (xQueueSend(g_playback_queue, &audio_frame, 0) != pdTRUE) {
+                            weak_signal_until_ms = now + 1500;
+                            if (now - last_gate_log_ms >= 1000) {
+                                last_gate_log_ms = now;
+                                ESP_LOGW(kTag, "播放队列满，音频帧被丢");
                             }
                         }
+                    } else if (now - last_gate_log_ms >= 1000) {
+                        last_gate_log_ms = now;
+                        ESP_LOGW(kTag, "ADPCM 状态非法: step=%u b3=%u",
+                                 audio_frame.initial_state.step_index, packet.payload[3]);
                     }
                     break;
+                }
                 case wp::MessageType::TalkEnd:
                     actions = controller.receive_end(packet.header, now);
                     break;
@@ -426,6 +515,23 @@ void ctrl_task(void *) {
                 weak_signal_until_ms = now + 1500;
             }
             next_rx_diag_ms = now + kRxDiagnosticsMs;
+        }
+        // RX 汇总（1s 节流）：接收态或有新计数时输出，直接对照
+        // 「发N/M 收N」屏幕诊断，定位音频断链在收端还是发端。
+        if (now - last_rx_summary_ms >= 1000) {
+            last_rx_summary_ms = now;
+            const uint32_t rx_a = g_rx_audio.load(std::memory_order_relaxed);
+            const uint32_t dropped_now = g_transport.dropped_rx_frames();
+            const auto st = controller.snapshot().state;
+            if (rx_a != last_summary_rx || dropped_now != last_summary_dropped ||
+                st == TalkState::Receiving || st == TalkState::Busy) {
+                ESP_LOGI(kTag, "RX诊断 音频帧=%lu 丢弃=%lu 播放队列=%u 状态=%d",
+                         (unsigned long)rx_a, (unsigned long)dropped_now,
+                         static_cast<unsigned>(uxQueueMessagesWaiting(g_playback_queue)),
+                         static_cast<int>(st));
+                last_summary_rx = rx_a;
+                last_summary_dropped = dropped_now;
+            }
         }
         g_weak_signal.store(static_cast<int32_t>(weak_signal_until_ms - now) > 0);
 
@@ -461,6 +567,7 @@ extern "C" {
 
 bool talkie_local_start(void) {
     if (g_running.exchange(true)) return true;
+    g_rx_audio.store(0);          // 诊断计数每次进近场重新计
 
     uint8_t channel = 1;
     nvs_handle_t handle{};

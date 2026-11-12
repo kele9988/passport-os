@@ -26,12 +26,14 @@
 #include "esp_heap_caps.h"
 #include "launcher/app_registry.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "nvs.h"
 #include "wifi_manager.h"
+#include "esp_wifi.h"
 
 #include <atomic>
 #include <cmath>
@@ -62,7 +64,7 @@ constexpr int CW = SCR_W - 2 * M;
 
 constexpr int WAVE_N = 12;
 constexpr int VOL_N = 8;
-constexpr int VOLUME_DEFAULT = 70;
+constexpr int VOLUME_DEFAULT = 100;
 // 收完最后一帧多久关掉播放通道。关掉才能让麦克风独占 codec(半双工)。
 constexpr int RX_HOLD_MS = 3000;
 // 切信道要按两下。三个键共用一路 ADC 分压，握持时手掌蹭到下键就会产生
@@ -114,6 +116,88 @@ std::atomic<int64_t> s_vol_arm_us{0};  // OK 键双击调音量的待命时刻�
 // app 主任务句柄，stop 时要它退干净
 TaskHandle_t s_task = nullptr;
 lv_timer_t *s_timer = nullptr;
+
+// ---------------------------------------------------------------- 近场独占射频
+// 近场对讲要求双方同射频信道，而 ESP32 只有一颗射频：STA 一旦关联 AP，频点
+// 就被锁在 AP 信道上，ESP-NOW 只能在该信道收发（esp_wifi_set_channel 会被
+// STA 拉回）。两台设备连不同路由器（或一台连一台不连）时自动对齐失效，
+// 各自显示「无同频设备」。对策：进近场前强制断开 STA 释放频点锁，所有设备
+// 回落固定信道 6（talkie_local.cc kRadioChannel），退出近场再恢复连接。
+// 这与「近场=不依赖网络」的产品语义一致；异地模式不受影响。
+bool s_sta_suspended = false;   // 进近场前 STA 是否在线（退出时据此恢复）
+
+// 近场禁轻睡眠锁：进近场后 STA 停转(其电源锁随之消失)，熄屏时 display_awake_lock
+// 也被释放 → 无任何锁阻止 auto light sleep。实测(2026-11-07)：近场+熄屏下系统
+// 深度轻睡后整机卡死——USB-JTAG 与 CPU 同域随睡眠掉电，串口/esptool 全部无响应，
+// 只能手动复位；此前「切模式后自动重启」「熄屏后失联」即此问题。
+// 近场的 ESP-NOW 收包中断、ADC 按键扫描、ADPCM 引擎都没有独立唤醒源保障，
+// 必须整段近场会话持有 NO_LIGHT_SLEEP。
+static esp_pm_lock_handle_t s_nearfield_pm_lock = nullptr;
+static bool s_nearfield_pm_held = false;
+
+static void nearfield_pm_hold(void) {
+    if (s_nearfield_pm_lock == nullptr) {
+        if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "talkie_nearfield",
+                               &s_nearfield_pm_lock) != ESP_OK) {
+            s_nearfield_pm_lock = nullptr;
+            return;
+        }
+    }
+    if (!s_nearfield_pm_held) {
+        esp_pm_lock_acquire(s_nearfield_pm_lock);
+        s_nearfield_pm_held = true;
+    }
+}
+
+static void nearfield_pm_release(void) {
+    if (s_nearfield_pm_lock != nullptr && s_nearfield_pm_held) {
+        esp_pm_lock_release(s_nearfield_pm_lock);
+        s_nearfield_pm_held = false;
+    }
+}
+
+// 进近场前调用：断开并停掉 STA，再把射频驱动重新拉起（无关联、无频点锁）。
+void talkie_wifi_suspend(void) {
+    nearfield_pm_hold();              // 近场期间禁止轻睡眠（见上方说明）
+    auto &wifi = WifiManager::GetInstance();
+    s_sta_suspended = wifi.IsConnected();
+
+    // 首次开机「手机设置」启动的配网热点可能一直挂在后台：离开应用只清了
+    // config_mode_active_ 标志，softAP 接口不一定真的拆掉（串口实证：对讲
+    // 启动时 wifi 仍是 sta+softAP）。softAP 活跃时射频被锁在 AP 信道，
+    // esp_wifi_set_channel 设不进去 → ESP-NOW 双方实际信道不受控 → 近场全断，
+    // 而屏幕显示的「射频信道6」只是配置值。这里检测到 AP 接口存在就整体
+    // 停掉射频、强制回 STA，把频点控制权完整拿回来。
+    wifi_mode_t mode{WIFI_MODE_NULL};
+    const bool has_ap = (esp_wifi_get_mode(&mode) == ESP_OK) &&
+                        (mode == WIFI_MODE_APSTA || mode == WIFI_MODE_AP);
+    if (has_ap) {
+        if (wifi.IsConfigMode()) wifi.StopConfigAp();  // 连带停掉配网页服务
+        esp_wifi_stop();
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        ESP_LOGW(TAG, "近场独占射频：检测到后台配网热点，已拆除(softAP→STA)");
+    } else if (s_sta_suspended) {
+        wifi.StopStation();               // 解关联 + esp_wifi_stop，并注销自动重连定时器
+    }
+    // 两种「驱动没在转」的状态这里统一兜底：
+    //  a. StopStation/esp_wifi_stop 后驱动已停但 mode 标志还在；
+    //  b. 冷启动且未配网：WifiManager 只 init 不 start，驱动从未转起来。
+    // 无条件 esp_wifi_start：已在转则幂等，无关联状态下信道由传输层自由设置。
+    esp_wifi_start();
+    ESP_LOGI(TAG, "近场独占射频：STA 已断开，ESP-NOW 回落固定信道 6");
+}
+
+// 退出近场后调用：恢复进近场前的 Wi-Fi 连接（异步，StartStation 自己扫描回连）。
+void talkie_wifi_restore(void) {
+    // 无条件归还轻睡眠锁：s_sta_suspended=false 的路径（进近场时本就没连
+    // Wi-Fi）同样进过 suspend 拿了锁，不能因为提前 return 把锁漏在手里，
+    // 否则设备从此永远不轻睡、电池狂掉。
+    nearfield_pm_release();
+    if (!s_sta_suspended) return;
+    s_sta_suspended = false;
+    WifiManager::GetInstance().StartStation();
+    ESP_LOGI(TAG, "退出近场：恢复 Wi-Fi 连接");
+}
 
 // ---------------------------------------------------------------- 小工具
 
@@ -428,6 +512,12 @@ void render() {
         std::snprintf(buf, sizeof(buf), "在线 %d 台", lsnap.peers);
         set_text(s_online_lbl, buf);
         set_text(s_chan_lbl, "");   // 近场模式信道已在顶栏 CHx 胶囊显示，不再重复
+        // 底部诊断行：发=esp_now_send 成功/失败数，收=收到的音频帧数。
+        // 发送端按住说话时"发"应快速上涨；接收端"收"应同步上涨。
+        // 发不涨=采集/编码断链；发涨收不涨=射频丢包；发涨收涨无声=播放链路。
+        std::snprintf(buf, sizeof(buf), "发%d/%d 收%d", lsnap.tx_ok, lsnap.tx_fail,
+                      lsnap.rx_audio);
+        set_text(s_foot, buf);
     } else {
         const int peers = talkie::joined() ? talkie::peers() : 0;
         std::snprintf(buf, sizeof(buf), "在线 %d 人", peers);
@@ -569,6 +659,40 @@ void tick(lv_timer_t *t) {
 
 // ---------------------------------------------------------------- 音频
 
+// 自愈：开机时 Init/Prepare 若碰到一次瞬时内存不足，会话资源就永久缺失
+// （旧逻辑只打日志不重试），表现为：录音缺 tx_ring → PTT 无反应；播放缺
+// play_ring → 收到帧也无声。这里限流 1 次/秒重试 Init+Prepare，内存不足时
+// 先归还蓝牙栈。Init 本身设计为可重入重试（worker 已在跑时直接返回 OK）。
+bool recover_audio() {
+    static int64_t last_try_us = 0;
+    const int64_t now = esp_timer_get_time();
+    if (now - last_try_us < 1000000) return false;   // 限流，避免每帧都硬试
+    last_try_us = now;
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 32 * 1024) {
+        ESP_LOGW(TAG, "音频自愈：连续内存不足(largest=%u)，归还蓝牙栈",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        wb_ble_guard_loan();
+    }
+    auto &audio = xiaozhi::AudioService::GetInstance();
+    const esp_err_t err = audio.Init(audio_workspace::Owner::Talkie);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "音频自愈：Init 失败 %s free=%u largest=%u", esp_err_to_name(err),
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    audio.SetPlaybackSampleRate(16000);
+    if (!audio.PrepareSessionResources()) {
+        ESP_LOGW(TAG, "音频自愈：会话资源准备失败 free=%u largest=%u",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return false;
+    }
+    s_audio_inited = true;
+    ESP_LOGI(TAG, "音频自愈：会话资源已恢复");
+    return true;
+}
+
 // 进入收听：只有真正要播才开通道，因为半双工下它会挡住麦克风
 bool ensure_playback() {
     auto &audio = xiaozhi::AudioService::GetInstance();
@@ -581,7 +705,9 @@ bool ensure_playback() {
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         s_playing = false;
-        return false;
+        // 资源缺失自愈：恢复成功后立刻重试一次
+        if (!recover_audio() || !audio.StartPlayback()) return false;
+        ESP_LOGI(TAG, "StartPlayback 自愈后成功");
     }
     // StartPlayback 内部按小智的语义把音量打到 100，对讲机要跟随本机音量设置，
     // 所以启动成功后立刻覆盖回来（此时 codec 已开，设置立即生效）。
@@ -605,7 +731,9 @@ bool begin_tx() {
         ESP_LOGW(TAG, "StartRecording 失败 free=%u largest=%u",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        return false;
+        // 资源缺失自愈：恢复成功后立刻重试一次
+        if (!recover_audio() || !audio.StartRecording()) return false;
+        ESP_LOGI(TAG, "StartRecording 自愈后成功");
     }
     talkie::set_talking(true);
     ESP_LOGI(TAG, "开始讲话");
@@ -640,18 +768,31 @@ void app_task(void *arg) {
             bool ok = false;
             if (to_local) {
                 remote_audio_stop();
+                // 同 talkie_app_start：近场直驱 bsp_audio 前确保 codec 已初始化
+                // （异地模式走 AudioService，切回近场时 profile 可能不匹配）
+                esp_err_t aerr = bsp_audio_init();
+                if (aerr == ESP_ERR_INVALID_STATE) {
+                    bsp_audio_deinit();
+                    aerr = bsp_audio_init();
+                }
+                if (aerr != ESP_OK) {
+                    ESP_LOGE(TAG, "近场音频初始化失败: %s", esp_err_to_name(aerr));
+                }
+                talkie_wifi_suspend();       // 近场独占射频：断 STA，回落固定信道 6
                 s_mode_local.store(true);
                 mode_save(true);
                 talkie_local_set_volume(s_volume);
                 ok = talkie_local_start();
                 if (!ok) {
                     ESP_LOGE(TAG, "近场模式启动失败，退回异地模式");
+                    talkie_wifi_restore();   // 退回异地，恢复 Wi-Fi
                     s_mode_local.store(false);
                     mode_save(false);
                     ok = remote_audio_start();
                 }
             } else {
                 talkie_local_stop();
+                talkie_wifi_restore();       // 退出近场：恢复 Wi-Fi 连接
                 s_mode_local.store(false);
                 mode_save(false);
                 // 近场进场时没归还蓝牙栈(进场只在异地模式才归还,见 start()),
@@ -667,6 +808,7 @@ void app_task(void *arg) {
                     ESP_LOGE(TAG, "异地模式音频启动失败，退回近场模式");
                     s_mode_local.store(true);
                     mode_save(true);
+                    talkie_wifi_suspend();   // 上面刚 restore 过，退回近场要再次独占
                     talkie_local_set_volume(s_volume);
                     talkie_local_start();
                     ok = true;
@@ -737,6 +879,7 @@ void app_task(void *arg) {
 
     if (s_mode_local.load()) {
         talkie_local_stop();
+        talkie_wifi_restore();               // 退出近场：恢复 Wi-Fi 连接
     } else {
         if (s_tx) end_tx();
         stop_playback();
@@ -799,8 +942,13 @@ extern "C" void talkie_app_start(void) {
             ESP_LOGE(TAG, "音频会话缓冲准备失败 free=%u largest=%u",
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            // 失败别置位 s_audio_inited（否则 remote_audio_stop 不会 Deinit，
+            // 且旧逻辑从此永不重试 = 双向音频永久瘫痪）。Deinit 释放干净，
+            // 等收到帧/按 PTT 时由 recover_audio() 自愈重试。
+            audio.Deinit();
+        } else {
+            s_audio_inited = true;
         }
-        s_audio_inited = true;
     }
     bsp_audio_set_volume(static_cast<uint8_t>(s_volume));
 
@@ -825,9 +973,26 @@ extern "C" void talkie_app_start(void) {
 
     // 起网络/引擎（按模式分流）
     if (local) {
+        // 近场直驱 bsp_audio，但本 app 从不初始化 codec —— 冷启动直接进对讲时
+        // s_dev==NULL，采集/播放任务的 bsp_audio_set_format 全部返回
+        // ESP_ERR_INVALID_STATE：发送端一帧音频都不发，接收端播放静默失败。
+        // 表现为「能发现设备、显示正在收听，800ms 后因收不到音频包超时退出」
+        // （信令/心跳不走音频，所以发现与状态显示都正常，极具迷惑性）。
+        // bsp_audio_init 幂等：s_dev 已在且 profile 相同直接 ESP_OK；
+        // 被其他 profile 占用（如收音机只开了 PLAYBACK）时先释放再抢。
+        esp_err_t aerr = bsp_audio_init();
+        if (aerr == ESP_ERR_INVALID_STATE) {
+            bsp_audio_deinit();
+            aerr = bsp_audio_init();
+        }
+        if (aerr != ESP_OK) {
+            ESP_LOGE(TAG, "近场音频初始化失败: %s", esp_err_to_name(aerr));
+        }
+        talkie_wifi_suspend();           // 近场独占射频：断 STA，回落固定信道 6
         talkie_local_set_volume(s_volume);
         if (!talkie_local_start()) {
             ESP_LOGE(TAG, "近场模式启动失败(ESP-NOW)");
+            talkie_wifi_restore();       // 启动失败别让 Wi-Fi 悬着
         }
     } else {
         if (!WifiManager::GetInstance().IsConnected()) {
@@ -853,6 +1018,7 @@ extern "C" void talkie_app_stop(void) {
     for (int i = 0; i < 60 && s_task != nullptr; ++i) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
+    talkie_wifi_restore();               // 幂等兜底：主任务退出路径里已恢复过则此处空操作
     if (s_mode_local.load()) {
         talkie_local_stop();
     } else {

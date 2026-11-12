@@ -32,7 +32,8 @@ enum class JitterPopResult : uint8_t {
 class AudioJitterBuffer {
 public:
     static constexpr size_t kCapacity = 8;
-    static constexpr size_t kPrefillFrames = 3;
+    // 预存 4 帧(80ms)再开播：吸收 ESP-NOW 到达抖动与音频帧双发的节奏波动
+    static constexpr size_t kPrefillFrames = 4;
 
     void reset();
     JitterPushResult push(const EncodedAudioFrame& frame);

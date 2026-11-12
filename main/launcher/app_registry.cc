@@ -33,7 +33,6 @@ extern const passport_app_t g_xiaozhi_app;
 extern const passport_app_t g_wifi_app;
 extern const passport_app_t g_settings_app;
 extern const passport_app_t g_home_app;
-extern const passport_app_t g_wb_app;
 
 namespace {
 
@@ -49,10 +48,12 @@ namespace {
 // 通话,更贴合这台机器的定位;收音机那套 HLS/TLS/AAC 解码也随之不再占用内存。
 // 2026-11-02(用户要求):应用排序调整为 小智 → 对讲机 → WorkBuddy → Vokie，
 // 设置仍收尾。
+// 2026-11-07(用户要求):WorkBuddy 伴生应用整体下架(app_wbconsole.cc 不再
+// 参与构建,wb_wifi_link 启动点也已移除),launcher 轮播与 switch_to 均不再
+// 有该卡位;wb_ble/wb_voice 底层仍保留编译,供对讲机/Vokie/小智共享 BLE 宿主。
 const passport_app_t *s_apps[] = {
     &g_xiaozhi_app,
     &g_talkie_app,
-    &g_wb_app,
     &g_voice_app,
     &g_settings_app,   // 设置放最后(应用惯用收尾位置)
 };

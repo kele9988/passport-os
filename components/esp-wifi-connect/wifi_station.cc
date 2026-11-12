@@ -4,6 +4,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
+#include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <nvs.h>
@@ -136,12 +137,19 @@ void WifiStation::OnDisconnected(std::function<void(int reason)> on_disconnected
 void WifiStation::Start() {
     // Note: esp_netif_init() and esp_wifi_init() should be called once before calling this method
     // WiFi driver is initialized by WifiManager::Initialize() and kept alive
-    
+
     // Clear stopped event bit so WaitForConnected works properly
     // Clear scan done bit so Stop() can wait for scan to complete
     xEventGroupClearBits(event_group_, WIFI_EVENT_STOPPED | WIFI_EVENT_SCAN_DONE_BIT);
-    
-    // Create or reuse the default WiFi station interface
+
+    // 清掉上一次会话残留的扫描定时器：suspend 的 has_ap 分支未走 Stop()，
+    // 重复 Start() 会创建第二个定时器，旧的仍在位，双重扫描互抢驱动。
+    if (timer_handle_ != nullptr) {
+        esp_timer_stop(timer_handle_);
+        esp_timer_delete(timer_handle_);
+        timer_handle_ = nullptr;
+    }
+
     station_netif_ = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (station_netif_ == nullptr) {
         station_netif_ = esp_netif_create_default_wifi_sta();
@@ -200,7 +208,20 @@ void WifiStation::Start() {
     connect_queue_.clear();
     reconnect_count_ = 0;
     scan_current_interval_microseconds_ = scan_min_interval_microseconds_;
-    ESP_ERROR_CHECK(esp_wifi_start());
+    // 关键：先停再启。近场模式 suspend 时曾直接 esp_wifi_start() 拉起驱动给
+    // ESP-NOW 用；若此处对【已在跑】的驱动重复 start，IDF 不会再发
+    // WIFI_EVENT_STA_START —— netif 的默认动作(拉起 lwIP/DHCP)与本类的
+    // StartScan 全挂在该事件上，结果是「表面成功、永不扫描、永远拿不到 IP」，
+    // 恰逢驱动状态错乱时 ESP_ERROR_CHECK 还会 abort 重启。对已停驱动 stop
+    // 幂等返回 OK，先 stop 保证 start 是真正的状态跃迁、事件必然重放。
+    esp_wifi_stop();
+    esp_err_t start_err = esp_wifi_start();
+    for (int i = 0; i < 3 && start_err == ESP_ERR_WIFI_STATE; ++i) {
+        // stop 的收尾在 wifi 任务里异步落地，个别时序下 start 会撞上过渡态
+        vTaskDelay(pdMS_TO_TICKS(100));
+        start_err = esp_wifi_start();
+    }
+    ESP_ERROR_CHECK(start_err);
     if (max_tx_power_ != 0) {
         ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(max_tx_power_));
     }

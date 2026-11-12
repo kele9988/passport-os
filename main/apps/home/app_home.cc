@@ -35,8 +35,7 @@
 #include "apps/home/home_upload.h"
 #include "apps/home/home_weather.h"
 #include "apps/voice/time_sync.h"
-#include "apps/wbconsole/wb_ble.h"
-#include "apps/wbconsole/wb_wifi_link.h"
+// 2026-11-07:WB 伴生应用下架,home 不再引用 wb_ble/wb_wifi_link。
 #include "launcher/app_registry.h"
 #include "bsp_display.h"
 #include "esp_lcd_panel_io.h"
@@ -1036,19 +1035,8 @@ void home_task(void *arg) {
             clock_on = false;
         }
 
-        // BLE 兜底(见 start() 里的说明):只在【开机以来从未连上过 PC】且已过
-        // 25 秒时才引导蓝牙栈,避免开机就吃掉 ~60KB 内部堆。一旦 TCP 连上过就
-        // 永久不再启(哪怕随后守护退出导致 TCP 断开)——那种场景下 PC 根本不在,
-        // 拉起 60KB 蓝牙毫无用处,反而会在用户点开 WB 时把堆吃光导致 OOM。
-        static bool s_ble_kicked = false;
-        static bool s_tcp_ever = false;
-        if (wb_wifi_link_connected()) s_tcp_ever = true;
-        if (!s_ble_kicked && !s_tcp_ever && (now_ms - start_ms) > 25000) {
-            const esp_err_t vis = wb_ble_visible_start();
-            ESP_LOGW(kTag, "开机 25s 内未连上 PC,BLE 兜底启动: %s", esp_err_to_name(vis));
-            s_ble_kicked = true;
-        }
-
+        // 2026-11-07:WB 伴生应用下架,原「TCP 25 秒未连上则 BLE 兜底」的
+        // WB 连接兜底逻辑一并移除(那块蓝牙只为 WB 守护服务)。
         // 资料(含头像)变化:先在锁外做文件 IO,再持锁更新 UI。
         const uint32_t profile_ver = home_profile_version();
         if (profile_ver != last_profile_ver) {
@@ -1210,18 +1198,7 @@ void home_start() {
     ESP_LOGI(kTag, "Home app started; free heap: %u KB",
              (unsigned)(esp_get_free_heap_size() / 1024));
 
-    // WiFi TCP 链路(优先通道):开机即启动,拿到 IP 后 TCP 7810 常开 +
-    // UDP 7811 广播宣告,PC 守护直连,不走蓝牙的扫描/回连时序。任务内部
-    // 等 WiFi 就绪,连不上 WiFi 就一直等,不占额外资源。
-    wb_wifi_link_start();
-
-    // BLE「常可见」不再开机即引导(2026-11-04 实测):NimBLE 主机栈一次吃掉
-    // ~60KB 内部堆,首页起来后只剩 9KB——天气 HTTPS 在证书校验阶段 alloc 失败
-    // (esp-x509-crt-bundle PK verify failed → alloc(2389) failed),WB 应用也因
-    // 堆不够被迫走 clean launch「重启换干净堆」,而冷启时 WiFi 还没连上又误判
-    // 可以引导 BLE,结果 UI 构建 OOM 硬崩,表现为「点开→整理内存→重启→回首页」。
-    // 改为延迟兜底:TCP 通道 25 秒内没连上(PC 不在/不在同一网段)时,由
-    // home_task 拉起蓝牙。不开蓝牙时首页可留 ~75KB,WB 可直接打开、天气也能取到。
+    // 2026-11-07:WB 伴生应用下架,WB WiFi TCP 链路(7810/7811)不再启动。
 }
 
 bool home_prepare_stop() {

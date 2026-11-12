@@ -24,6 +24,10 @@ typedef struct {
     int requesting;   // 正在申请发言权
     int weak;         // 信号弱/丢帧
     char speaker[9];  // 当前发言人名(收听时)，"AP-XXXX"
+    // 诊断计数（2026-11-06 加，用于远程定位「能连上但听不到声音」）：
+    int tx_ok;        // 本机 esp_now_send 成功次数（含心跳/信令/音频）
+    int tx_fail;      // esp_now_send 失败次数（>0 说明发送队列/驱动异常）
+    int rx_audio;     // 本机收到的音频帧总数（decode 成功即计，未过滤）
 } talkie_local_snapshot_t;
 
 // 启动本地模式（ESP-NOW + 音频任务）。失败返回 false（UI 提示）。

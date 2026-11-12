@@ -2,13 +2,13 @@
 
 int bsp_audio_volume_configure(esp_codec_dev_handle_t dev) {
     // Preserve the low-noise curve through 80%. Reserve the upper range for
-    // extra speaker headroom; +6 dB is a tuning candidate, not a measured
-    // distortion-free limit. Do not restore the previous +18 dB maximum.
+    // extra speaker headroom; +8 dB at 100% is a tuning candidate, not a
+    // measured distortion-free limit. (1106: +10 有轻微破音，回落到 +8)
     static const esp_codec_dev_vol_map_t points[] = {
         { .vol = 0,   .db_value = -50.0f },
         { .vol = 80,  .db_value = -10.0f },
-        { .vol = 90,  .db_value = -2.0f },
-        { .vol = 100, .db_value = 6.0f },
+        { .vol = 90,  .db_value = 0.0f },
+        { .vol = 100, .db_value = 8.0f },
     };
     esp_codec_dev_vol_curve_t curve = {
         .vol_map = (esp_codec_dev_vol_map_t *)points,

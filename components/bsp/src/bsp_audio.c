@@ -297,7 +297,7 @@ static esp_err_t set_format(uint32_t hz, uint8_t bits, uint8_t ch) {
     //   驱动已按采样率与 MCLK 精确算好,覆写会导致 ADC/DAC 时序错乱、录音回放全是杂音。
     //   这里只恢复麦克风模拟 PGA 增益和逻辑音量。close/open 会重置 codec 的输出
     //   状态；若不恢复，16kHz 录音切到 24kHz TTS 后可能保持静音。
-    if (s_rx) esp_codec_dev_set_in_gain(s_dev, 30.0f);
+    if (s_rx) esp_codec_dev_set_in_gain(s_dev, 32.0f);
     const uint8_t actual_volume = bsp_audio_volume_effective(s_requested_volume, s_master_volume);
     if (s_tx && bsp_audio_volume_apply(s_dev, s_requested_volume, s_master_volume) != 0) {
         ESP_LOGE(TAG, "恢复输出音量失败: %u%%", actual_volume);
@@ -331,8 +331,32 @@ esp_err_t bsp_audio_write(const void *pcm, size_t bytes) {
 // 低于喂狗 IDLE, 卡住不会拖垮系统; 会话结束由 s_active 标志退出循环, 最后一次
 // read 返回后才检查, 所以最坏多等一块(100ms)。
 esp_err_t bsp_audio_read(void *pcm, size_t bytes) {
-    if (!s_dev || !s_opened || !s_rx) return ESP_ERR_INVALID_STATE;
-    return esp_codec_dev_read(s_dev, pcm, bytes) == 0 ? ESP_OK : ESP_FAIL;
+    if (!s_dev || !s_opened || !s_rx) {
+        // 诊断：区分哪个守卫失败（对讲音频断链排查）
+        static TickType_t s_guard_last;
+        TickType_t now = xTaskGetTickCount();
+        if (s_guard_last == 0 || now - s_guard_last > pdMS_TO_TICKS(2000)) {
+            s_guard_last = now;
+            ESP_LOGE(TAG, "read 守卫失败: dev=%d opened=%d rx=%d",
+                     s_dev != NULL, s_opened, s_rx != NULL);
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+    int r = esp_codec_dev_read(s_dev, pcm, bytes);
+    static TickType_t s_drv_last;
+    if (r != 0) {
+        TickType_t now = xTaskGetTickCount();
+        if (s_drv_last == 0 || now - s_drv_last > pdMS_TO_TICKS(2000)) {
+            s_drv_last = now;
+            i2s_chan_info_t info = {0};
+            int enabled = -1;
+            if (i2s_channel_get_info(s_rx, &info) == ESP_OK) enabled = (int)info.is_enabled;
+            ESP_LOGE(TAG, "read 驱动失败: r=%d rx_enabled=%d", r, enabled);
+        }
+    } else {
+        s_drv_last = 0;
+    }
+    return r == 0 ? ESP_OK : ESP_FAIL;
 }
 
 void bsp_audio_set_volume(uint8_t percent) {
@@ -341,6 +365,16 @@ void bsp_audio_set_volume(uint8_t percent) {
     s_requested_volume = percent;
     if (s_opened && s_tx && bsp_audio_volume_apply(s_dev, s_requested_volume, s_master_volume) != 0) {
         ESP_LOGW(TAG, "应用音量设置失败");
+    }
+    control_unlock();
+}
+
+void bsp_audio_set_volume_direct(uint8_t percent) {
+    control_lock();
+    if (percent > 100) percent = 100;
+    s_requested_volume = percent;
+    if (s_opened && s_tx && bsp_audio_volume_apply(s_dev, s_requested_volume, 100) != 0) {
+        ESP_LOGW(TAG, "应用直通音量失败");
     }
     control_unlock();
 }

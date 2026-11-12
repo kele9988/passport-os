@@ -9,7 +9,13 @@ extern "C" OpusEncoder *__real_opus_encoder_create(int32_t, int, int, int *);
 extern "C" void __real_opus_encoder_destroy(OpusEncoder *);
 extern "C" OpusEncoder *__wrap_opus_encoder_create(int32_t rate, int channels,
                                                   int application, int *error) {
-    if (audio_workspace::owner.load() != audio_workspace::Owner::Xiaozhi)
+    // 对讲机与小智共用同一编码配置(16kHz/单声道/60ms/complexity 0),同样放进
+    // 共享静态存储:近场⇄联网运行时切换后,WS 兜底 TLS 已把堆碎片化,真实
+    // malloc 需要的大块连续内存不再可得(largest~18KB),编码器必 NO_MEM,
+    // 表现为「切回联网永远失败退回近场」。编码器与解码器半双工互斥,
+    // 与小智共享同一 aux 切片是安全的。
+    const auto o = audio_workspace::owner.load();
+    if (o != audio_workspace::Owner::Xiaozhi && o != audio_workspace::Owner::Talkie)
         return __real_opus_encoder_create(rate,channels,application,error);
     const int bytes=opus_encoder_get_size(channels);
     if (bytes<=0 || static_cast<size_t>(bytes)>audio_workspace::kAuxBytes) {

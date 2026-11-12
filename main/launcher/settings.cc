@@ -33,7 +33,8 @@ constexpr uint8_t kBrightness[] = {20, 40, 60, 80, 100};
 constexpr uint16_t kTimeouts[] = {0, 15, 30, 60, 120, 300};
 constexpr size_t kRowCount = 9;
 
-uint8_t s_volume = 80;
+uint8_t s_volume = 100;  // 1106: 默认 80→100。80 档曲线=-10dB，小智 TTS 和异地对讲
+                         // 都被主音量压到这一档，用户反馈偏小；100 档=+8dB 与近场直通一致。
 uint8_t s_brightness = 80;
 uint16_t s_timeout = 60;
 ui_theme_t s_theme = UI_THEME_CLASSIC;
@@ -382,7 +383,7 @@ void settings_bootstrap(void) {
         }
         nvs_close(handle);
     }
-    if (s_volume > 100) s_volume = 80;
+    if (s_volume > 100) s_volume = 100;
     s_brightness = validated(kBrightness, s_brightness, static_cast<uint8_t>(80));
     s_timeout = validated(kTimeouts, s_timeout, static_cast<uint16_t>(60));
     ui_theme_set(s_theme);

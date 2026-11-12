@@ -43,6 +43,10 @@ esp_err_t bsp_audio_read(void *pcm, size_t bytes);
 // 输出音量 0..100(%)。
 void bsp_audio_set_volume(uint8_t percent);
 
+// 输出音量 0..100(%)，【不乘主音量】。对讲等点对点场景专用：主音量默认 80%
+// 会把 100% 请求压到 80 档(-10dB)，听感骤降；此接口按 100% 主音量直接应用。
+void bsp_audio_set_volume_direct(uint8_t percent);
+
 // 整机主音量 0..100(%)。所有 App 请求的音量都会按此比例缩放，避免 App
 // 在启动时用自己的默认值覆盖用户的整机设置。
 void bsp_audio_set_master_volume(uint8_t percent);

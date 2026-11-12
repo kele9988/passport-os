@@ -8,7 +8,10 @@
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_websocket_client.h"
+#include "esp_crt_bundle.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/netdb.h"
@@ -62,6 +65,17 @@ constexpr int kHeartbeatMs = 10000;
 constexpr int kRetryMs = 4000;
 constexpr int kRecvTimeoutMs = 500;     // SO_RCVTIMEO:顺便当内务节拍
 
+// WS 兜底通道（编译期注入 TALKIE_WS_HOST，见 CMakeLists）。
+// 中转服务器只有公网 IPv6 时，纯 IPv4 网络（手机热点）下 TCP 全失败，
+// 此时改走 wss://<TALKIE_WS_HOST>（Cloudflare 隧道回源家里 WS 桥再转
+// 本地 relay），TB 帧协议原样透传。代价是 CF 边缘绕行 ~200ms，仅作兜底。
+#ifndef TALKIE_WS_HOST
+#define TALKIE_WS_HOST ""
+#endif
+constexpr const char *kWsHost = TALKIE_WS_HOST;
+// WS 模式下写入 s_sock 的哨兵值：真实 fd 都是小整数，不会撞上。
+constexpr int kWssSock = 7777;
+
 // ---------------------------------------------------------------- 共享状态
 
 SemaphoreHandle_t s_lock = nullptr;     // 保护 socket 写入
@@ -87,6 +101,129 @@ uint16_t s_rx_len[kRxSlots];
 std::atomic<int> s_rx_head{0};
 std::atomic<int> s_rx_tail{0};
 SemaphoreHandle_t s_rx_lock = nullptr;
+
+// ---- WS 兜底传输状态 ----
+// esp_websocket_client 事件回调收字节 → 按整条 WS 消息攒齐 → 推入 ring，
+// recv 路径从 ring 里当普通字节流读，上层 TB 帧解析完全不变。
+void set_error(const char *fmt, ...);
+
+esp_websocket_client_handle_t s_ws = nullptr;
+std::atomic<bool> s_ws_up{false};
+RingbufHandle_t s_ws_ring = nullptr;
+uint8_t s_ws_msg[1024];          // 单条 WS 消息攒包缓冲(最大帧 kMaxFrame 内)
+size_t s_ws_msg_len = 0;
+size_t s_ws_msg_expect = 0;      // 本条消息总长(0=未知,收首片时确定)
+
+void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *event_data) {
+    auto *ev = static_cast<esp_websocket_event_data_t *>(event_data);
+    switch (id) {
+        case WEBSOCKET_EVENT_CONNECTED:
+            s_ws_up.store(true);
+            ESP_LOGW(TAG, "WS 已连接(兜底通道)");
+            break;
+        case WEBSOCKET_EVENT_DATA: {
+            if (s_ws_up.load() && ev->data_len > 0 && ev->op_code == 0x2) {  // binary
+                if (ev->payload_offset == 0) {
+                    s_ws_msg_len = 0;
+                    s_ws_msg_expect = ev->payload_len;
+                }
+                if (s_ws_msg_len + (size_t)ev->data_len <= sizeof(s_ws_msg)) {
+                    memcpy(s_ws_msg + s_ws_msg_len, ev->data_ptr, ev->data_len);
+                    s_ws_msg_len += (size_t)ev->data_len;
+                }
+                if (s_ws_msg_len >= s_ws_msg_expect && s_ws_msg_len > 0) {
+                    xRingbufferSend(s_ws_ring, s_ws_msg, s_ws_msg_len, pdMS_TO_TICKS(200));
+                    s_ws_msg_len = 0;
+                    s_ws_msg_expect = 0;
+                }
+            }
+            break;
+        }
+        case WEBSOCKET_EVENT_DISCONNECTED:
+        case WEBSOCKET_EVENT_CLOSED:
+            s_ws_up.store(false);
+            break;
+        default:
+            break;
+    }
+}
+
+// 起 WS 客户端并等待握手完成。成功返回 true（此后 s_sock 语义切换为 kWssSock）。
+bool ws_dial() {
+    if (kWsHost[0] == '\0') return false;
+    char uri[96];
+    std::snprintf(uri, sizeof(uri), "wss://%s", kWsHost);
+    esp_websocket_client_config_t cfg = {};
+    cfg.uri = uri;
+    cfg.buffer_size = 1024;
+    cfg.reconnect_timeout_ms = 5000;
+    cfg.network_timeout_ms = 10000;
+    cfg.task_stack = 6144;
+    // 本 IDF 的 esp-tls 不允许无校验源的 TLS,必须给证书包(覆盖 CF 边缘证书)。
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+
+    if (!s_ws_ring) {
+        // 16KB:音频 ~25KB/s 下给足 ~600ms 余量,防止 net_task 短暂繁忙时丢音频
+        s_ws_ring = xRingbufferCreate(16384, RINGBUF_TYPE_BYTEBUF);
+        if (!s_ws_ring) { set_error("WS ring 创建失败"); return false; }
+    }
+    // 清掉上一条连接可能残留的字节
+    for (;;) {
+        size_t n = 0;
+        void *item = xRingbufferReceiveUpTo(s_ws_ring, &n, 0, 1024);
+        if (!item) break;
+        vRingbufferReturnItem(s_ws_ring, item);
+    }
+
+    s_ws = esp_websocket_client_init(&cfg);
+    if (!s_ws) { set_error("WS 客户端创建失败"); return false; }
+    esp_websocket_register_events(s_ws, WEBSOCKET_EVENT_ANY, ws_event_handler, nullptr);
+    s_ws_msg_len = 0;
+    s_ws_msg_expect = 0;
+    s_ws_up.store(false);
+    esp_websocket_client_start(s_ws);
+    // 最多等 12 秒握手(TLS+WS+CF 隧道链路长)
+    for (int i = 0; i < 24 && !s_ws_up.load(); ++i) {
+        if (!s_run.load()) break;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (!s_ws_up.load()) {
+        set_error("WS 兜底连接失败(%s)", kWsHost);
+        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(1000));
+        esp_websocket_client_destroy(s_ws);
+        s_ws = nullptr;
+        return false;
+    }
+    ESP_LOGW(TAG, "已连接 %s (WS 兜底)", kWsHost);
+    return true;
+}
+
+void ws_teardown() {
+    s_ws_up.store(false);
+    if (s_ws) {
+        esp_websocket_client_close(s_ws, pdMS_TO_TICKS(500));
+        esp_websocket_client_destroy(s_ws);
+        s_ws = nullptr;
+    }
+    if (s_ws_ring) {
+        // 清掉跨连接的残留字节,防止下条连接吃到旧帧
+        for (;;) {
+            size_t n = 0;
+            void *item = xRingbufferReceiveUpTo(s_ws_ring, &n, 0, 1024);
+            if (!item) break;
+            vRingbufferReturnItem(s_ws_ring, item);
+        }
+    }
+}
+
+// 统一关链路:WS 模式关客户端,TCP 模式关 fd。
+void link_close_fd(int fd) {
+    if (fd == kWssSock) {
+        ws_teardown();
+    } else if (fd >= 0) {
+        close(fd);
+    }
+}
 
 void set_error(const char *fmt, ...) {
     va_list ap;
@@ -244,9 +381,20 @@ bool send_audio(const uint8_t *data, size_t len) {
     uint8_t pkt[proto::kHeaderLen + proto::kMaxFrame];
     proto::put_header(pkt, proto::kTypeAudio, static_cast<uint16_t>(len), s_tx_seq.fetch_add(1));
     memcpy(pkt + proto::kHeaderLen, data, len);
-    const int rc = send(s_sock, pkt, proto::kHeaderLen + len, 0);
+    int rc;
+    if (s_sock == kWssSock) {
+        // WS 兜底模式:整帧一条 binary 消息。此前漏了这条分支,
+        // send(-2) 每帧 EBADF → UI 显示"正在说话"但对方完全没声音。
+        rc = s_ws_up.load()
+                 ? esp_websocket_client_send_bin(s_ws, reinterpret_cast<const char *>(pkt),
+                                                 proto::kHeaderLen + len, pdMS_TO_TICKS(300))
+                 : -1;
+        if (rc < 0) ESP_LOGW(TAG, "WS send_audio 失败 rc=%d up=%d", rc, (int)s_ws_up.load());
+    } else {
+        rc = send(s_sock, pkt, proto::kHeaderLen + len, 0);
+        if (rc < 0) ESP_LOGW(TAG, "send 失败 errno=%d", errno);
+    }
     xSemaphoreGive(s_lock);
-    if (rc < 0) ESP_LOGW(TAG, "send 失败 errno=%d", errno);
     return rc == static_cast<int>(proto::kHeaderLen + len);
 }
 
@@ -259,7 +407,16 @@ bool send_frame(uint8_t type, const uint8_t *payload, size_t len) {
     if (len > 16) len = 16;
     proto::put_header(pkt, type, static_cast<uint16_t>(len), s_tx_seq.fetch_add(1));
     if (len) memcpy(pkt + proto::kHeaderLen, payload, len);
-    const int rc = send(s_sock, pkt, proto::kHeaderLen + len, 0);
+    int rc;
+    if (s_sock == kWssSock) {
+        // WS 模式:整帧一条 binary 消息。对端桥原样转发给 relay。
+        rc = s_ws_up.load()
+                 ? esp_websocket_client_send_bin(s_ws, reinterpret_cast<const char *>(pkt),
+                                                 proto::kHeaderLen + len, pdMS_TO_TICKS(300))
+                 : -1;
+    } else {
+        rc = send(s_sock, pkt, proto::kHeaderLen + len, 0);
+    }
     xSemaphoreGive(s_lock);
     return rc > 0;
 }
@@ -382,7 +539,28 @@ int dial(const Config &cfg) {
 
 // 读满 n 字节，处理 EAGAIN(超时)与对端关闭。
 // 返回 true 表示读满；false 表示连接已不可用。
+// WS 模式(s == kWssSock)：从 ring buffer 按字节流读，内部循环拼满为止；
+// 断链时 s_ws_up 变 false，下一轮 recv 立即失败返回，效果同 TCP 对端关闭。
 bool recv_exact(int s, uint8_t *buf, size_t n, std::atomic<bool> *running) {
+    if (s == kWssSock) {
+        size_t got = 0;
+        while (got < n) {
+            if (running && !running->load()) return false;
+            if (!s_ws_up.load()) return false;
+            size_t chunk = 0;
+            const TickType_t wait = pdMS_TO_TICKS(kRecvTimeoutMs);
+            void *item = xRingbufferReceiveUpTo(s_ws_ring, &chunk, wait, n - got);
+            if (item && chunk > 0) {
+                memcpy(buf + got, item, chunk);
+                vRingbufferReturnItem(s_ws_ring, item);
+                got += chunk;
+        } else if (!item && !s_ws_up.load()) {
+            ESP_LOGW(TAG, "recv_exact: WS 断链 已读%u/%u", (unsigned)got, (unsigned)n);  // DEBUG
+            return false;   // 等待期间断链
+        }
+        }
+        return true;
+    }
     size_t got = 0;
     while (got < n) {
         if (running && !running->load()) return false;
@@ -390,10 +568,12 @@ bool recv_exact(int s, uint8_t *buf, size_t n, std::atomic<bool> *running) {
         if (rc > 0) {
             got += static_cast<size_t>(rc);
         } else if (rc == 0) {
+            ESP_LOGW(TAG, "recv_exact: 对端关闭(FIN) 已读%u/%u", (unsigned)got, (unsigned)n);  // DEBUG
             return false;                        // 对端正常关闭
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // 只是接收超时
             if (errno == EINTR) continue;
+            ESP_LOGE(TAG, "recv_exact: rc=%d errno=%d 已读%u/%u", rc, errno, (unsigned)got, (unsigned)n);  // DEBUG
             return false;
         }
     }
@@ -463,7 +643,7 @@ bool do_join(int s, const Config &cfg, std::atomic<bool> *running) {
 void drop_link(const char *why) {
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
         if (s_sock >= 0) {
-            close(s_sock);
+            link_close_fd(s_sock);
             s_sock = -1;
         }
         xSemaphoreGive(s_lock);
@@ -493,27 +673,34 @@ void net_task(void *arg) {
         s_state.store(State::kConnecting);
 
         const int s = dial(cfg);
-        if (s < 0) {
+        int sock = s;
+        // TCP 全失败(热点纯 v4 下服务器只有 IPv6 等)→ WS 兜底通道。
+        if (sock < 0 && kWsHost[0] != '\0') {
+            ESP_LOGW(TAG, "TCP 全失败,尝试 WS 兜底 (%s)", kWsHost);
+            if (ws_dial()) sock = kWssSock;
+        }
+        if (sock < 0) {
             if (s_gen.load() != my_gen || !s_run.load()) break;
             if (first) s_state.store(State::kFailed);
             vTaskDelay(pdMS_TO_TICKS(kRetryMs));
             first = false;
             continue;
         }
-        // 拨号最长阻塞 kConnectTimeoutSec，期间代际可能已更替（快速切房间）。
-        // 这个 socket 属于旧房间，必须关掉走人，绝不能写进 s_sock 顶撞新任务。
+        // 拨号最长阻塞 kConnectTimeoutSec(WS 最长 12s)，期间代际可能已更替
+        // （快速切房间）。这个连接属于旧房间，必须关掉走人，绝不能写进
+        // s_sock 顶撞新任务。
         if (s_gen.load() != my_gen || !s_run.load()) {
-            close(s);
+            link_close_fd(sock);
             break;
         }
 
         if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-        s_sock = s;
-        owned_sock = s;
+        s_sock = sock;
+        owned_sock = sock;
         if (s_lock) xSemaphoreGive(s_lock);
         first = false;
 
-        if (!do_join(s, cfg, &s_run)) {
+        if (!do_join(sock, cfg, &s_run)) {
             if (s_gen.load() != my_gen) break;
             drop_link(nullptr);
             owned_sock = -1;
@@ -533,7 +720,7 @@ void net_task(void *arg) {
         bool link_ok = true;
         while (s_run.load() && s_gen.load() == my_gen && link_ok) {
             uint8_t hdr[proto::kHeaderLen];
-            if (!recv_exact(s, hdr, sizeof(hdr), &s_run)) {
+            if (!recv_exact(sock, hdr, sizeof(hdr), &s_run)) {
                 link_ok = false;
                 break;
             }
@@ -550,7 +737,7 @@ void net_task(void *arg) {
                 break;
             }
             uint8_t body[proto::kMaxFrame];
-            if (len && !recv_exact(s, body, len, &s_run)) {
+            if (len && !recv_exact(sock, body, len, &s_run)) {
                 link_ok = false;
                 break;
             }
@@ -579,6 +766,8 @@ void net_task(void *arg) {
         }
 
         if (!s_run.load() || s_gen.load() != my_gen) break;
+        if (s_err[0]) ESP_LOGW(TAG, "断链原因: %s", s_err);  // DEBUG
+        else ESP_LOGW(TAG, "断链原因: (未记录,recv循环静默失败)");  // DEBUG
         drop_link("链路断开，正在重连");
         owned_sock = -1;
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -589,7 +778,7 @@ void net_task(void *arg) {
     const bool current = (s_gen.load() == my_gen);
     if (s_lock && xSemaphoreTake(s_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
         if (owned_sock >= 0 && s_sock == owned_sock) {
-            close(s_sock);
+            link_close_fd(s_sock);
             s_sock = -1;
         }
         xSemaphoreGive(s_lock);

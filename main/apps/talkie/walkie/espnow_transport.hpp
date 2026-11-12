@@ -42,6 +42,9 @@ public:
     const protocol::DeviceId &device_id() const { return device_id_; }
     uint8_t radio_channel() const { return radio_channel_; }
     uint32_t dropped_rx_frames() const { return dropped_rx_frames_.load(std::memory_order_relaxed); }
+    // 诊断：esp_now_send 调用成功/失败计数（广播无 ACK，成功≠对端收到）
+    uint32_t tx_ok() const { return tx_ok_.load(std::memory_order_relaxed); }
+    uint32_t tx_fail() const { return tx_fail_.load(std::memory_order_relaxed); }
 
 private:
     static void receive_callback(const esp_now_recv_info_t *info, const uint8_t *data, int size);
@@ -53,6 +56,8 @@ private:
     protocol::DeviceId device_id_{};
     uint8_t radio_channel_{6};
     std::atomic<uint32_t> dropped_rx_frames_{0};
+    std::atomic<uint32_t> tx_ok_{0};
+    std::atomic<uint32_t> tx_fail_{0};
     bool initialized_{false};
     static EspNowTransport *instance_;
 };

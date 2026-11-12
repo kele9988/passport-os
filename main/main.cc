@@ -8,7 +8,6 @@
 #include "launcher/power.h"
 #include "apps/home/home_profile.h"
 #include "apps/talkie/talkie_link.h"
-#include "apps/wbconsole/wb_wifi_link.h"
 #include "wifi_manager.h"
 #include "ssid_manager.h"
 #include "bsp_battery.h"
@@ -27,6 +26,8 @@
 #include "bsp_memory.h"
 #include "lvgl.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -214,13 +215,49 @@ static void input_task(void *arg) {
 static void system_monitor_task(void *arg) {
     (void)arg;
     unsigned battery_tick = 0;
+    unsigned up_seconds = 0;
+    // USB 插着时禁用轻睡眠:USJ 外设在轻睡眠中掉线,Windows 重枚举时会触发
+    // ESP_RST_USB 硬复位(取证实测 reason=11),把调试会话搅成一锅"假崩溃"。
+    // 拔掉 USB(真实使用/纯充电由硬件路径决定)恢复省电轻睡。
+    int ls_state = -1;   // -1=未配置
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        ++up_seconds;
         bsp_memory_sample();
         if (++battery_tick >= 10) {
             battery_tick = 0;
+            const bool usb_on = usb_serial_jtag_is_connected();
+            const int want = usb_on ? 0 : 1;   // USB 连接=禁轻睡
+            if (want != ls_state) {
+                const esp_pm_config_t pm = {
+                    .max_freq_mhz = 160, .min_freq_mhz = 40,
+                    .light_sleep_enable = want != 0};
+                if (esp_pm_configure(&pm) == ESP_OK) {
+                    ls_state = want;
+                    ESP_LOGI(TAG, "电源策略切换: %s (USB%s)",
+                             want ? "允许轻睡眠" : "禁止轻睡眠",
+                             usb_on ? "已连接" : "未连接");
+                }
+            }
             bsp_battery_poll();
             if (power_battery_tick()) key_post_wait({kPowerCommand, BTN_EVT_CLICK, 3});
+        }
+        // 每 60s 把运行时长落 NVS(调试取证:区分真崩溃与 USB 复位假死)。
+        // 首次写尝试无论成败都打一行日志——之前静默失败,prev_up 恒为 0 无从排查。
+        if (up_seconds % 60 == 0) {
+            static bool s_nvs_reported = false;
+            nvs_handle_t h = 0;
+            esp_err_t err = nvs_open("diag", NVS_READWRITE, &h);
+            if (err == ESP_OK) {
+                err = nvs_set_u32(h, "last_up", up_seconds);
+                if (err == ESP_OK) err = nvs_commit(h);
+                nvs_close(h);
+            }
+            if (!s_nvs_reported) {
+                s_nvs_reported = true;
+                ESP_LOGI(TAG, "NVS 前世时长写入: %s (up=%lus)",
+                         esp_err_to_name(err), (unsigned long)up_seconds);
+            }
         }
         wifi_setup_tick();
         settings_tick();
@@ -321,9 +358,10 @@ static void handle_serial_command(int c) {
         ui_sfx_log_diagnostics();
         bsp_memory_dump();
         bsp_memory_dump_recent_failures();
-        ESP_LOGI(TAG, "Input stacks: input_free=%u serial_free=%u",
+        ESP_LOGI(TAG, "Input stacks: input_free=%u serial_free=%u btn_poll_free=%u",
             (unsigned)uxTaskGetStackHighWaterMark(xTaskGetHandle("input_disp")),
-            (unsigned)uxTaskGetStackHighWaterMark(xTaskGetHandle("ser_cmd")));
+            (unsigned)uxTaskGetStackHighWaterMark(xTaskGetHandle("ser_cmd")),
+            (unsigned)uxTaskGetStackHighWaterMark(xTaskGetHandle("btn_poll")));
         esp_pm_config_t config{};
         if (esp_pm_get_configuration(&config) == ESP_OK)
             ESP_LOGI(TAG, "Power: min=%d max=%d auto_sleep=%d screen_on=%d free_heap=%u largest=%u minimum=%u heap_ok=%d",
@@ -340,10 +378,8 @@ static void handle_serial_command(int c) {
         // 调试时从任意 App 一步退回轮播,不必等空闲超时。
         app_registry_switch_to(APP_ID_LAUNCHER);
     } else if (c == 'w') {
-        // 直跳 WorkBuddy:ID 14 超出 1-9 数字直跳范围,而 launcher 会记忆
-        // 上次卡位,靠 d/o 序列导航不可靠(经常误进相邻应用)。
-        ESP_LOGW(TAG, "[SerialCmd] jump to WorkBuddy");
-        app_registry_switch_to(APP_ID_WB);
+        // WorkBuddy 伴生应用已于 2026-11-07 整体下架,'w' 保留作占位提示。
+        ESP_LOGW(TAG, "[SerialCmd] WorkBuddy app removed; 'w' is a no-op now");
     } else if (c == 't') {
         // 直跳网络对讲机(同样超出数字直跳范围)
         ESP_LOGW(TAG, "[SerialCmd] jump to Talkie");
@@ -386,6 +422,63 @@ static void serial_cmd_task(void *arg) {
     }
 }
 
+// 上次复位原因取证:现场复现过「近场+熄屏 ~2 分钟后崩溃重启」,但崩溃瞬间
+// USB-JTAG 随硬复位断链,panic 输出全部丢失,开机第一屏的 rst: 行也会赶在
+// 主机串口重枚举完成之前打完。所以:开机打一遍 + 10 秒后 esp_timer 重打一遍
+// (那时主机早已重连上,必能收到)。brownout(7) / 中断看门狗(4) / 任务看门狗(5)
+// / panic(3) 各指向完全不同的修法,这一行是唯一能拿到的一手证据。
+static char s_rst_reason_line[96];
+static int s_rst_relog_shots = 0;
+
+static void log_reset_reason(void) {
+    const int rst = esp_reset_reason();
+    const char *name = "UNKNOWN";
+    switch (rst) {
+        case ESP_RST_UNKNOWN: name = "UNKNOWN"; break;
+        case ESP_RST_POWERON: name = "POWERON"; break;
+        case ESP_RST_EXT:     name = "EXT_PIN"; break;
+        case ESP_RST_SW:      name = "SW"; break;
+        case ESP_RST_PANIC:   name = "PANIC"; break;
+        case ESP_RST_INT_WDT: name = "INT_WDT"; break;
+        case ESP_RST_TASK_WDT: name = "TASK_WDT"; break;
+        case ESP_RST_WDT:     name = "OTHER_WDT"; break;
+        case ESP_RST_DEEPSLEEP: name = "DEEPSLEEP"; break;
+        case ESP_RST_BROWNOUT: name = "BROWNOUT"; break;
+        case ESP_RST_USB:     name = "USB_PERIPH"; break;
+        case ESP_RST_JTAG:    name = "JTAG"; break;
+        case ESP_RST_PWR_GLITCH: name = "PWR_GLITCH"; break;
+        case ESP_RST_CPU_LOCKUP: name = "CPU_LOCKUP"; break;
+        default: break;
+    }
+    // 前世运行时长:USB 供电下拔插必然断电复位,uptime 无法区分「芯片崩溃重启」
+    // 和「USB-JTAG 轻睡眠假死」。运行期每 60s 把 uptime 写进 NVS,开机读出,
+    // 上次活了多久一读便知 —— 这是区分两者的唯一手段。
+    uint32_t prev_up = 0;
+    {
+        nvs_handle_t h = 0;
+        if (nvs_open("diag", NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_u32(h, "last_up", &prev_up);
+            nvs_close(h);
+        }
+    }
+    std::snprintf(s_rst_reason_line, sizeof(s_rst_reason_line),
+                  ">>> 上次复位原因: %d (%s), 上次连续运行 %lus <<<", rst, name,
+                  (unsigned long)prev_up);
+    if (rst != ESP_RST_POWERON) {
+        ESP_LOGW(TAG, "%s", s_rst_reason_line);
+    }
+}
+
+// 重复重打(开机后 10/40/70/100/130/160s):崩溃后 USB 需重枚举,主机串口
+// 什么时候重连上不确定,单次 10s 会被错过。打满 6 次后静默(定时器留着空转,
+// 不在回调里 stop 自己 —— IDF 对回调内 stop 的行为有版本差异,不值得赌)。
+static void reset_reason_relog_timer(void *arg) {
+    (void)arg;
+    if (s_rst_relog_shots >= 6 || esp_reset_reason() == ESP_RST_POWERON) return;
+    ++s_rst_relog_shots;
+    ESP_LOGW(TAG, "%s", s_rst_reason_line);
+}
+
 extern "C" void app_main(void) {
     power_boot_check();    // 注:上电瞬间的白屏由 bootloader_components/bl_early 在二级 bootloader 里
     bsp_memory_init();
@@ -421,6 +514,22 @@ extern "C" void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // 复位原因取证必须在 nvs_flash_init 之后:log_reset_reason 要读 NVS 里的
+    // "前世时长"(system_monitor 每 60s 写入的运行秒数)。之前放在 init 之前,
+    // nvs_open 恒失败,prev_up 永远是 0 —— 取证彻底失明。
+    log_reset_reason();
+    {
+        const esp_timer_create_args_t rr_args = {
+            .callback = reset_reason_relog_timer, .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK, .name = "rst_reason_relog",
+            .skip_unhandled_events = false};
+        esp_timer_handle_t rr_timer = nullptr;
+        if (esp_timer_create(&rr_args, &rr_timer) == ESP_OK) {
+            // 首打 30s,此后每 30s 重打,最多 6 次(30/60/90/120/150/180s)
+            esp_timer_start_periodic(rr_timer, 30 * 1000000ULL);
+        }
+    }
 
     // 头像/名片分区在后台挂载;残留其他固件时在此格式化(十余秒),
     // 不让手机上传请求承担这段耗时。堆此时最完整,SPIFFS 缓冲也放在低地址。
@@ -471,11 +580,7 @@ extern "C" void app_main(void) {
         // 首页启动时拉起 WiFi TCP/UDP 广播，而开机默认直进对讲机后首页永不
         // 启动 → 守护永远看不到设备（无广播）→ 语音/监控全断。任务内部自等
         // WiFi 就绪且防重入，app_home 里的调用保留无害。
-        // 注意：这里【不】调 wb_ble_visible_start()——NimBLE 主机栈一开机就
-        // 引导会吃掉约 40KB 内部堆，对讲机/WB 的 24.5KB 音频工作区直接分配
-        // 失败，进 WB 应用建 UI 时 LVGL OOM panic（实测）。BLE 由原 guard
-        // loan 机制在音频资源分配后懒启动；PC 侧走 TCP 不依赖蓝牙。
-        wb_wifi_link_start();
+        // 2026-11-07：WB 伴生应用整体下架,WB WiFi 链路不再启动。
         if (clean_target != APP_ID_COUNT) {
             ESP_LOGI(TAG, "Clean launch into app %d", (int)clean_target);
             chime = false;
