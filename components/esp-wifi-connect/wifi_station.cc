@@ -166,8 +166,8 @@ void WifiStation::Start() {
     // 启用 IPv6。esp_netif_create_default_wifi_sta() 建出来的 netif 默认只在
     // IPv4 栈上活动,没有 link-local 地址就不会发 Router Solicitation,
     // lwIP 也就收不到 RA、永远拿不到全局 IPv6 —— 表现是连 AAAA 域名时
-    // connect() 直接 EHOSTUNREACH(118)。对讲机走 talkie.kele9988.top
-    // (只有 AAAA)就是卡在这一步。全局地址由 CONFIG_LWIP_IPV6_AUTOCONFIG
+    // connect() 直接 EHOSTUNREACH(118)。对讲机使用仅含 AAAA 记录的域名
+    // 时就是卡在这一步。全局地址由 CONFIG_LWIP_IPV6_AUTOCONFIG
     // 在收到 RA 时自动生成,这里只需把接口启起来。
     const esp_err_t v6_ll = esp_netif_create_ip6_linklocal(station_netif_);
     if (v6_ll == ESP_OK) {

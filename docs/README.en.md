@@ -19,7 +19,6 @@ People have suggested many personal improvements. Because everyone uses the hard
 | Home | Clock, profile, portraits, cards, weather, and air quality | Network for weather and air quality |
 | Xiaozhi AI | Spoken conversations through the microphone and speaker | Network and Xiaozhi service configuration |
 | Walkie-Talkie | Hold to talk, release to listen; two devices link directly nearby or through a relay server | Nearby needs no network; off-site needs your own relay server |
-| WorkBuddy | Desktop voice console: voice input, hotkeys, and a computer status page | Companion computer program over Wi-Fi or Bluetooth |
 | Vokie Mic | Turn the device into a wireless microphone; hold to speak, release to send | Companion computer program |
 | Settings | Volume, brightness, theme, auto-sleep, and Wi-Fi setup | — |
 
@@ -29,10 +28,14 @@ Previously open-sourced projects keep their own source, guides, and companions (
 
 - [Muse: ai-passport-muse](https://github.com/manchunx7-bit/ai-passport-muse): standalone module source and usage guide.
 - [AI Voice: folo-ai-passport-voice](https://github.com/manchunx7-bit/folo-ai-passport-voice): voice application source, Windows companion, and usage guide.
+- [Companion programs & talkie server: passport-companion](https://github.com/kele9988/passport-companion): Windows companion apps, walkie-talkie relay / web peer / WS bridge source, and self-hosting guide.
+
+> This repository is derived from the FoloToy community firmware [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) (MIT License);
+> the baseline comes from the six-app public edition maintained by [@manchunx7-bit](https://github.com/manchunx7-bit) (handed over on 2026-11-03). Thanks to upstream and community contributors.
 
 ## Install
 
-Using a prebuilt image does not require AI tools or a firmware development environment. When a matching release is available, download it from [GitHub Releases](https://github.com/manchunx7-bit/passport-os/releases).
+Using a prebuilt image does not require AI tools or a firmware development environment. When a matching release is available, download it from [GitHub Releases](https://github.com/kele9988/passport-os/releases).
 
 Use only the matching FoloToy AI Passport hardware revision with ESP32-C3 and 8 MB Flash. Similar-looking boards may have incompatible displays, audio chips, buttons, or partition layouts.
 
@@ -43,7 +46,7 @@ Use only the matching FoloToy AI Passport hardware revision with ESP32-C3 and 8 
 
 **Back up first.** A full image overwrites configuration in its written range. A complete reset also requires erasing flash. To preserve settings and images, verify the partition layout and use the application image without erasing the whole flash.
 
-On first boot, connect your phone to the device's password-free `Passport-WiFi-xxxx` hotspot and open `http://192.168.4.1`. Follow the setup page to select Wi-Fi, city, and personal details. Xiaozhi needs your own service configuration; WorkBuddy and Vokie Mic need their companion computer programs.
+On first boot, connect your phone to the device's password-free `Passport-WiFi-xxxx` hotspot and open `http://192.168.4.1`. Follow the setup page to select Wi-Fi, city, and personal details. Xiaozhi needs your own service configuration; Vokie Mic needs its companion computer program.
 
 ## Make your own version
 
@@ -63,7 +66,7 @@ Download the source, modify the apps or interface, build a firmware image, and t
 Install Git, ESP-IDF 5.5.3, and its toolchain. On Windows, you can build in WSL and flash through a Windows serial port.
 
 ```bash
-git clone https://github.com/manchunx7-bit/passport-os.git
+git clone https://github.com/kele9988/passport-os.git
 cd passport-os
 bash build.sh release
 ```

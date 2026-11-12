@@ -4,11 +4,11 @@
 
 **把一块小硬件，折腾成每天会用的小玩意。**
 
-FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 6 款功能与应用
+FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 5 款功能与应用
 
 **简体中文** · [English](docs/README.en.md)
 
-[看看能玩什么](#六款应用装进口袋) · [安装固件](#先用起来) · [自己改一版](#把它改成你的版本) · [关联项目](#老朋友们)
+[看看能玩什么](#五款应用装进口袋) · [安装固件](#先用起来) · [自己改一版](#把它改成你的版本) · [关联项目](#老朋友们)
 
 </div>
 
@@ -18,20 +18,19 @@ FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 6 款功能与应�
 
 首先，感谢大家对这个项目的喜欢和支持。收到这么多反馈，让这件原本只为自己做的小事，多了很多继续折腾的理由。
 
-制作 Passport OS 的初衷很简单：把这块硬件变成一个我自己会经常使用的“小玩意”。经过一轮轮尝试和筛选，我留下了日常用得上的 6 款功能与应用：能聊两句、能对讲，也能对着电脑说话输入。
+制作 Passport OS 的初衷很简单：把这块硬件变成一个我自己会经常使用的“小玩意”。经过一轮轮尝试和筛选，我留下了日常用得上的 5 款功能与应用：能聊两句、能对讲。
 
 大家提出了不少有意思的个性化需求。每个人的使用习惯不同，与其把所有想法都塞进同一个固件，不如把项目开放出来，让大家自己动手：增加喜欢的功能，删掉用不上的部分，做一个更适合自己的版本。
 
 > 希望它既能成为你日常用得上的工具，也能成为值得折腾的小玩具。大家玩得开心！
 
-## 六款应用，装进口袋
+## 五款应用，装进口袋
 
 | 应用 | 可以做什么 | 使用条件 |
 | --- | --- | --- |
 | 首页 | 时钟、个人资料、头像与名片、天气和空气质量 | 天气与空气质量需要联网 |
 | 小智 AI | 通过麦克风和扬声器进行语音对话 | 网络与小智服务配置 |
 | 对讲机 | 按住说话、松开收听；两台设备近场直连，异地可经中转服务通话 | 近场无需网络；异地需自建中转服务 |
-| WorkBuddy | 电脑语音控制台：语音输入、快捷键与电脑状态页 | 电脑配套程序，Wi-Fi 或蓝牙连接 |
 | Vokie 麦克风 | 把设备变成电脑的无线麦克风，按住说话、松开发送 | 电脑配套程序 |
 | 设置 | 音量、亮度、主题、自动熄屏与 Wi-Fi 配网 | — |
 
@@ -45,10 +44,14 @@ FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 6 款功能与应�
 | --- | --- | --- |
 | Muse | [ai-passport-muse](https://github.com/manchunx7-bit/ai-passport-muse) | Muse 应用模块源码与使用教程 |
 | AI 随身语音 | [folo-ai-passport-voice](https://github.com/manchunx7-bit/folo-ai-passport-voice) | 随身语音源码、Windows 电脑端程序与使用教程 |
+| 电脑端程序与对讲服务端 | [passport-companion](https://github.com/kele9988/passport-companion) | 本固件配套的 Windows 电脑端程序、对讲中转/网页对端/WS 桥源码与自建部署指南 |
+
+> 本仓库基于 FoloToy 官方社区固件 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport)（MIT License）衍生，
+> 基线来自 [@manchunx7-bit](https://github.com/manchunx7-bit) 维护的六应用公开版（2026-11-03 交接）。感谢上游与社区贡献者。
 
 ## 先用起来
 
-**只想使用现有功能，不需要安装 AI 工具或编译环境。** 有对应版本的发布包时，从 [GitHub Releases](https://github.com/manchunx7-bit/passport-os/releases) 下载固件即可。想修改功能，再看下方的源码构建流程。
+**只想使用现有功能，不需要安装 AI 工具或编译环境。** 有对应版本的发布包时，从 [GitHub Releases](https://github.com/kele9988/passport-os/releases) 下载固件即可。想修改功能，再看下方的源码构建流程。
 
 适用硬件：**相同硬件版本的 FoloToy AI Passport，ESP32-C3、8 MB Flash**。外观相似的其他开发板不能直接套用。
 
@@ -69,7 +72,7 @@ FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 6 款功能与应�
 3. 按页面提示选择 Wi-Fi、设置城市和个人资料；头像与名片按需添加。
 4. 完成设置后返回首页，开始使用。
 
-小智需要使用者自己的服务配置；WorkBuddy 与 Vokie 麦克风需要运行电脑端配套程序。
+小智需要使用者自己的服务配置；Vokie 麦克风需要运行电脑端配套程序。
 
 </details>
 
@@ -96,7 +99,7 @@ FoloToy AI Passport 社区固件 · ESP32-C3 · 8 MB Flash · 6 款功能与应�
 准备 **Git、ESP-IDF 5.5.3** 及其配套工具链。Windows 用户可以在 WSL 中构建，再从 Windows 串口烧录。
 
 ```bash
-git clone https://github.com/manchunx7-bit/passport-os.git
+git clone https://github.com/kele9988/passport-os.git
 cd passport-os
 bash build.sh release
 ```
